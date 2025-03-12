@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Image Region Similarity Search</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 1000px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        .container {
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+        .canvas-container {
+            position: relative;
+            border: 1px solid #ccc;
+            margin-bottom: 20px;
+        }
+        canvas {
+            display: block;
+        }
+        .controls {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+        button {
+            padding: 8px 16px;
+            cursor: pointer;
+        }
+        .results {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+            gap: 15px;
+        }
+        .result-item {
+            border: 1px solid #eee;
+            padding: 10px;
+            text-align: center;
+        }
+        .result-item img {
+            max-width: 100%;
+            height: auto;
+        }
+        .status {
+            margin: 10px 0;
+            padding: 10px;
+            background-color: #f5f5f5;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Image Region Similarity Search</h1>
+        
+        <div>
+            <input type="file" id="imageUpload" accept="image/*">
+            <p>Upload an image, then draw a region by clicking and dragging</p>
+        </div>
+        
+        <div class="canvas-container">
+            <canvas id="imageCanvas"></canvas>
+        </div>
+        
+        <div class="controls">
+            <button id="clearRegion">Clear Region</button>
+            <button id="searchSimilar">Search Similar Regions</button>
+        </div>
+        
+        <div class="status" id="status">Ready</div>
+        
+        <h2>Results</h2>
+        <div class="results" id="results"></div>
+    </div>
+
+    <script>
+        // Canvas setup and drawing functionality
+        const canvas = document.getElementById('imageCanvas');
+        const ctx = canvas.getContext('2d');
+        const imageUpload = document.getElementById('imageUpload');
+        const clearRegionBtn = document.getElementById('clearRegion');
+        const searchSimilarBtn = document.getElementById('searchSimilar');
+        const statusEl = document.getElementById('status');
+        const resultsEl = document.getElementById('results');
+        
+        let originalImage = null;
+        let isDrawing = false;
+        let startX = 0;
+        let startY = 0;
+        let endX = 0;
+        let endY = 0;
+        
+        // Load image when uploaded
+        imageUpload.addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (file) {
+                const reader = new FileReader();
+                reader.onload = function(event) {
+                    originalImage = new Image();
+                    originalImage.onload = function() {
+                        // Set canvas size to match image
+                        canvas.width = originalImage.width;
+                        canvas.height = originalImage.height;
+                        // Draw image on canvas
+                        ctx.drawImage(originalImage, 0, 0);
+                    };
+                    originalImage.src = event.target.result;
+                };
+                reader.readAsDataURL(file);
+            }
+        });
+        
+        // Drawing rectangle on canvas
+        canvas.addEventListener('mousedown', (e) => {
+            if (!originalImage) return;
+            
+            const rect = canvas.getBoundingClientRect();
+            startX = e.clientX - rect.left;
+            startY = e.clientY - rect.top;
+            isDrawing = true;
+        });
+        
+        canvas.addEventListener('mousemove', (e) => {
+            if (!isDrawing) return;
+            
+            const rect = canvas.getBoundingClientRect();
+            endX = e.clientX - rect.left;
+            endY = e.clientY - rect.top;
+            
+            // Redraw image and rectangle
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.drawImage(originalImage, 0, 0);
+            
+            // Draw selection rectangle
+            ctx.strokeStyle = 'red';
+            ctx.lineWidth = 2;
+            const width = endX - startX;
+            const height = endY - startY;
+            ctx.strokeRect(startX, startY, width, height);
+        });
+        
+        canvas.addEventListener('mouseup', () => {
+            isDrawing = false;
+        });
+        
+        // Clear selection
+        clearRegionBtn.addEventListener('click', () => {
+            if (!originalImage) return;
+            
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.drawImage(originalImage, 0, 0);
+            startX = startY = endX = endY = 0;
+        });
+        
+        // Search for similar images
+        searchSimilarBtn.addEventListener('click', async () => {
+            if (!originalImage || (startX === endX && startY === endY)) {
+                statusEl.textContent = 'Please upload an image and draw a region first';
+                return;
+            }
+            
+            try {
+                // Extract the selected region
+                const regionWidth = Math.abs(endX - startX);
+                const regionHeight = Math.abs(endY - startY);
+                const regionX = Math.min(startX, endX);
+                const regionY = Math.min(startY, endY);
+                
+                // Make sure we have a valid region
+                if (regionWidth < 3 || regionHeight < 3) {
+                    statusEl.textContent = 'Region too small, please draw a larger area';
+                    return;
+                }
+                
+                // Create a new canvas for the region
+                const regionCanvas = document.createElement('canvas');
+                regionCanvas.width = regionWidth;
+                regionCanvas.height = regionHeight;
+                const regionCtx = regionCanvas.getContext('2d');
+                
+                // Draw the region to the canvas
+                regionCtx.drawImage(
+                    originalImage, 
+                    regionX, regionY, regionWidth, regionHeight,
+                    0, 0, regionWidth, regionHeight
+                );
+                
+                // Get region data URL
+                const regionDataUrl = regionCanvas.toDataURL('image/jpeg');
+                
+                // Process with DINO v2 and search for similar images
+                await findSimilarImages(regionDataUrl);
+                
+            } catch (error) {
+                statusEl.textContent = `Error: ${error.message}`;
+                console.error('Error:', error);
+            }
+        });
+        
+        // Function to process region with DINO v2 and find similar images
+        // Function to process region with DINO v2 and find similar images
+        async function findSimilarImages(regionDataUrl) {
+            statusEl.textContent = 'Processing region with DINO v2...';
+            
+            try {
+                // Convert dataURL to blob for upload
+                const base64Response = await fetch(regionDataUrl);
+                const blob = await base64Response.blob();
+                
+                // Create form data for API request
+                const formData = new FormData();
+                formData.append('region_image', blob, 'region.jpg');
+                
+                // Send the region to the DINO v2 backend
+                statusEl.textContent = 'Sending region to DINO v2 service...';
+                
+                const response = await fetch('http://localhost:5000/api/process-region', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                if (!response.ok) {
+                    throw new Error(`Server responded with status: ${response.status}`);
+                }
+                
+                const data = await response.json();
+                
+                if (data.error) {
+                    throw new Error(data.error);
+                }
+                
+                // Display results
+                displayResults(data.results);
+                statusEl.textContent = `Found ${data.results.length} similar regions`;
+                
+            } catch (error) {
+                statusEl.textContent = `Error processing image: ${error.message}`;
+                console.error('Error processing image:', error);
+            }
+        }
+
+        // Function to display the results
+        function displayResults(results) {
+            resultsEl.innerHTML = '';
+            
+            if (!results || results.length === 0) {
+                statusEl.textContent = 'No similar regions found';
+                return;
+            }
+            
+            results.forEach((result, index) => {
+                const resultItem = document.createElement('div');
+                resultItem.className = 'result-item';
+                
+                const img = document.createElement('img');
+                img.src = result.image_data;
+                img.alt = `Similar region ${index + 1}`;
+                
+                const score = document.createElement('p');
+                score.textContent = `Similarity: ${result.similarity.toFixed(2)}`;
+                
+                resultItem.appendChild(img);
+                resultItem.appendChild(score);
+                resultsEl.appendChild(resultItem);
+            });
+        }
+
+
+    </script>
+</body>
+</html>
