@@ -35,59 +35,88 @@ transform = T.Compose([
     T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
 
-# Create a database of feature vectors from your images
-# This would be initialized at startup
-image_db = {
-    "features": [],  # List to store feature vectors
-    "paths": [],     # List to store corresponding image paths
-    "index": None    # FAISS index for fast similarity search
-}
+image_db = {}
 
-def initialize_database(image_folder):
-    """Initialize the image database by extracting features from all images."""
+def normalize_region_for_feature_extraction(region_image):
+    """
+    Scale region to 224x224 while preserving aspect ratio with padding.
+    This prevents distortion when resizing small regions.
+    """
+    width, height = region_image.size
+    
+    # Determine scaling factor
+    scale = min(224/width, 224/height)
+    new_width, new_height = int(width * scale), int(height * scale)
+    
+    # Resize while preserving aspect ratio
+    region_resized = region_image.resize((new_width, new_height))
+    
+    # Create padded image (black background)
+    padded_image = Image.new("RGB", (224, 224))
+    
+    # Center the region in the padded image
+    paste_x = (224 - new_width) // 2
+    paste_y = (224 - new_height) // 2
+    padded_image.paste(region_resized, (paste_x, paste_y))
+    
+    return padded_image
+
+
+
+def initialize_database(image_folder, scale_factors=[1.0, 0.66, 0.33]):
+    """
+    Initialize the image database with an image pyramid approach.
+    Each image is stored at multiple scales to improve matching small regions.
+    """
     print(f"Building image database from {image_folder}...")
     
     image_paths = list(Path(image_folder).glob("**/*.jpg")) + list(Path(image_folder).glob("**/*.png"))
     
     features = []
     paths = []
+    metadata = []  # To store additional info like scale factor
     
-    for img_path in image_paths:
+    for img_idx, img_path in enumerate(image_paths):
         try:
-            # Load and process image
-            try:
-                image = Image.open(img_path).convert("RGB")
-            except Exception as e:
-                print(f"Could not open image {img_path}: {e}")
-                continue
+            # Load image
+            image = Image.open(img_path).convert("RGB")
+            orig_width, orig_height = image.size
+            
+            # Process each scale factor
+            for scale in scale_factors:
+                if scale == 1.0:
+                    # Original image
+                    scaled_image = image
+                else:
+                    # Calculate new dimensions
+                    new_width = int(orig_width * scale)
+                    new_height = int(orig_height * scale)
+                    
+                    # Skip very small scales
+                    if new_width < 64 or new_height < 64:
+                        continue
+                        
+                    # Create scaled version
+                    scaled_image = image.resize((new_width, new_height))
                 
-            # Apply transformations
-            try:
-                image_tensor = transform(image).unsqueeze(0).to(device)
-            except Exception as e:
-                print(f"Error transforming image {img_path}: {e}")
-                continue
+                # Extract features from this scaled version
+                try:
+                    feature = extract_features(scaled_image)
+                    
+                    # Add to our collections
+                    features.append(feature)
+                    paths.append(str(img_path))
+                    metadata.append({
+                        "original_path": str(img_path),
+                        "scale": scale,
+                        "width": scaled_image.width,
+                        "height": scaled_image.height
+                    })
+                except Exception as e:
+                    print(f"Error extracting features from scaled image {img_path} at scale {scale}: {e}")
             
-            # Extract features
-            try:
-                with torch.no_grad():
-                    outputs = model(image_tensor)
-                    # Make sure the feature is a numpy array with correct type
-                    feature = outputs.last_hidden_state[:, 0].cpu().numpy().astype(np.float32)
-            except Exception as e:
-                print(f"Error extracting features from {img_path}: {e}")
-                continue
-            
-            # Ensure feature is the right shape and type
-            if not isinstance(feature, np.ndarray):
-                print(f"Feature from {img_path} is not a numpy array, skipping")
-                continue
-                
-            features.append(feature.flatten())
-            paths.append(str(img_path))
-            
-            if len(paths) % 100 == 0:
-                print(f"Processed {len(paths)} images")
+            if (img_idx + 1) % 100 == 0:
+                print(f"Processed {img_idx + 1}/{len(image_paths)} images ({len(features)} total entries)")
                 
         except Exception as e:
             print(f"Error processing {img_path}: {e}")
@@ -110,17 +139,34 @@ def initialize_database(image_folder):
     index.add(features_array)
     
     # Update the global image_db
-    image_db["features"] = features_array
-    image_db["paths"] = paths
-    image_db["index"] = index
+    image_db = {
+        "features": features_array,
+        "paths": paths,
+        "metadata": metadata,
+        "index": index
+    }
     
-    print(f"Database initialized with {len(paths)} images")
+    print(f"Database initialized with {len(paths)} entries from {len(image_paths)} images")
+    return image_db
 
 def extract_features(image):
-    """Extract features from an image using DINO v2."""
+    """
+    Extract features from an image using DINO v2.
+    Now enhanced to better handle small regions.
+    """
+    # Check if this is a small region
+    width, height = image.size
+    is_small_region = width < 100 or height < 100
+    
     # Convert to RGB if necessary
     if image.mode != "RGB":
         image = image.convert("RGB")
+    
+    # For small regions, consider enhancing contrast to make features stand out
+    if is_small_region:
+        from PIL import ImageEnhance
+        enhancer = ImageEnhance.Contrast(image)
+        image = enhancer.enhance(1.3)  # Slightly boost contrast
     
     # Apply transformations
     image_tensor = transform(image).unsqueeze(0).to(device)
@@ -128,35 +174,110 @@ def extract_features(image):
     # Extract features using DINO v2
     with torch.no_grad():
         outputs = model(image_tensor)
-        # Explicitly convert to numpy array with float32 type
+        # Use CLS token features
         feature = outputs.last_hidden_state[:, 0].cpu().numpy().astype(np.float32)
     
     return feature.flatten()
 
-def find_similar_images(query_feature, top_k=8):
-    """Find similar images based on feature similarity."""
-    # Normalize query vector for cosine similarity
+def size_aware_matching(query_image, image_db, top_k=8):
+    """
+    Find similar images with awareness of region size and scale.
+    """
+    # Get query dimensions
+    query_width, query_height = query_image.size
+    query_area = query_width * query_height
+    
+    # Normalize region to preserve aspect ratio
+    normalized_query = normalize_region_for_feature_extraction(query_image)
+    
+    # Extract features from normalized image
+    query_feature = extract_features(normalized_query)
+    
+    # Normalize for cosine similarity
     query_feature = query_feature.reshape(1, -1).astype('float32')
     faiss.normalize_L2(query_feature)
     
-    # Search for similar vectors
-    D, I = image_db["index"].search(query_feature, top_k)
+    # Search for more candidates than needed
+    expanded_k = min(top_k * 3, len(image_db["paths"]))
+    D, I = image_db["index"].search(query_feature, expanded_k)
     
-    # Get results
+    # Process results with size adjustment
     results = []
-    for i, (score, idx) in enumerate(zip(D[0], I[0])):
-        if idx < len(image_db["paths"]):  # Ensure valid index
-            results.append({
-                "path": image_db["paths"][idx],
-                "similarity": float(score),
-                "rank": i + 1
-            })
+    for score, idx in zip(D[0], I[0]):
+        if idx < len(image_db["paths"]):
+            path = image_db["paths"][idx]
+            meta = image_db["metadata"][idx] if "metadata" in image_db else None
+            
+            # Get scale factor if available
+            scale = meta["scale"] if meta and "scale" in meta else 1.0
+            
+            try:
+                # Get original image dimensions
+                with Image.open(path) as img:
+                    img_width, img_height = img.size
+                    
+                    # For scaled entries, adjust the effective area
+                    effective_width = img_width * scale
+                    effective_height = img_height * scale
+                    effective_area = effective_width * effective_height
+                    
+                    # Calculate size ratio
+                    size_ratio = query_area / effective_area
+                    
+                    # Adjust score based on size ratio
+                    if size_ratio < 0.05:
+                        adjusted_score = score * (0.3 + 0.7 * size_ratio * 20)
+                    elif size_ratio < 0.2:
+                        adjusted_score = score * (0.7 + 0.3 * size_ratio * 5)
+                    else:
+                        adjusted_score = score
+                    
+                    # Boost scores for downscaled images when query is small
+                    if query_area < 10000 and scale < 1.0:
+                        # Boost more for smaller regions
+                        scale_boost = 1.0 + (1.0 - scale) * 0.2
+                        adjusted_score *= scale_boost
+                    
+                    results.append({
+                        "path": path,
+                        "raw_similarity": float(score),
+                        "adjusted_similarity": float(adjusted_score),
+                        "size_ratio": float(size_ratio),
+                        "scale": float(scale)
+                    })
+            except Exception as e:
+                print(f"Error processing {path}: {e}")
+                results.append({
+                    "path": path,
+                    "raw_similarity": float(score),
+                    "adjusted_similarity": float(score),
+                    "size_ratio": 1.0,
+                    "scale": float(scale) if meta and "scale" in meta else 1.0
+                })
     
-    return results
+    # Sort by adjusted similarity
+    results.sort(key=lambda x: x["adjusted_similarity"], reverse=True)
+    
+    # Take top_k, removing duplicates (same image at different scales)
+    unique_results = []
+    seen_paths = set()
+    
+    for result in results:
+        # Extract original path without scale information
+        original_path = result["path"]
+        
+        if original_path not in seen_paths:
+            seen_paths.add(original_path)
+            unique_results.append(result)
+            
+            if len(unique_results) >= top_k:
+                break
+    
+    return unique_results
 
 @app.route('/api/process-region', methods=['POST'])
 def process_region():
-    """Process a region and find similar images."""
+    """Process a region and find similar images with size-aware matching."""
     if 'region_image' not in request.files:
         return jsonify({"error": "No region_image provided"}), 400
     
@@ -165,19 +286,20 @@ def process_region():
         region_file = request.files['region_image']
         region_image = Image.open(io.BytesIO(region_file.read()))
         
-        # Extract features from the region
-        query_feature = extract_features(region_image)
-        
-        # Find similar images
-        similar_images = find_similar_images(query_feature, top_k=8)
+        # Find similar images with size-aware matching
+        similar_images = size_aware_matching(region_image, image_db, top_k=8)
         
         # Prepare response
         response = {
             "success": True,
+            "query_size": {
+                "width": region_image.width,
+                "height": region_image.height
+            },
             "results": []
         }
         
-        # For each similar image, read it and convert to base64
+        # Process results
         for result in similar_images:
             img_path = result["path"]
             try:
@@ -186,7 +308,9 @@ def process_region():
                     
                     response["results"].append({
                         "image_data": f"data:image/jpeg;base64,{img_data}",
-                        "similarity": result["similarity"],
+                        "similarity": result["adjusted_similarity"],
+                        "raw_similarity": result["raw_similarity"],
+                        "size_ratio": result["size_ratio"],
                         "path": os.path.basename(img_path)
                     })
             except Exception as e:
@@ -195,13 +319,16 @@ def process_region():
         return jsonify(response)
         
     except Exception as e:
+        print(f"Error in process_region: {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
 # Initialize the database at startup
 if __name__ == "__main__":
     # image folder path
     IMAGE_FOLDER = "/home/parisol/Downloads/Img_annot/Img_annot/images/"
-    initialize_database(IMAGE_FOLDER)
+    image_db = initialize_database(IMAGE_FOLDER)
     
     # Run the Flask app
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    app.run(debug=True, host='0.0.0.0', use_reloader=False, port=5000)

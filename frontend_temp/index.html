@@ -172,7 +172,7 @@
                 const regionY = Math.min(startY, endY);
                 
                 // Make sure we have a valid region
-                if (regionWidth < 3 || regionHeight < 3) {
+                if (regionWidth < 1 || regionHeight < 1) {
                     statusEl.textContent = 'Region too small, please draw a larger area';
                     return;
                 }
